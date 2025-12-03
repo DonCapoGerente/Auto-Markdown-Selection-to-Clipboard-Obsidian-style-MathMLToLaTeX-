@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Auto Markdown Selection to Clipboard (Obsidian-style + MathMLToLaTeX)
+// @name         Auto Markdown Selection to Clipboard (Obsidian-style + MathMLToLaTeX + MediaWiki/Wikipedia)
 // @namespace    https://github.com/yourname/userscripts
-// @version      2025.03.20.5
-// @description  Convert selected content to Markdown with proper inline/display LaTeX math, and auto-copy to clipboard (similar to Obsidian Web Clipper behavior).
+// @version      2025.03.20.7
+// @description  Convert selected content to Markdown with proper inline/display LaTeX math, and auto-copy to clipboard (similar to Obsidian Web Clipper behavior). Includes special handling for Wikipedia/MediaWiki math.
 // @author       you
 // @license      MIT
 // @match        *://*/*
@@ -30,7 +30,6 @@
         headingStyle: 'atx'
     });
 
-    // GFM-Plugin (verschiedene UMD-Namen abfangen)
     let gfmPlugin = null;
     if (typeof turndownPluginGfm !== 'undefined') {
         gfmPlugin = turndownPluginGfm;
@@ -44,12 +43,8 @@
         console.warn('[AutoMarkdown] GFM plugin not found. GFM features disabled.');
     }
 
-    // WICHTIG: keine LaTeX-Sonderbehandlung mehr im Escape, weil wir
-    // Math komplett über Platzhalter aus Turndown herausnehmen.
-    // => Standard-Escaping von Turndown reicht.
-
     // ---------------------------------------------------------------------
-    // Helper: Zugriff auf MathMLToLaTeX (UMD-Global auf window)
+    // Helper: MathMLToLaTeX
     // ---------------------------------------------------------------------
     function getMathMLToLatex() {
         if (typeof MathMLToLaTeX !== 'undefined' && MathMLToLaTeX && typeof MathMLToLaTeX.convert === 'function') {
@@ -64,7 +59,7 @@
     }
 
     // ---------------------------------------------------------------------
-    // Helper: wrap LaTeX as inline or display math
+    // LaTeX-Wrapping + Platzhalter
     // ---------------------------------------------------------------------
     function wrapLatex(latex, inline) {
         const txt = (latex || '').trim();
@@ -72,9 +67,6 @@
         return inline ? `$${txt}$` : `$$\n${txt}\n$$`;
     }
 
-    // ---------------------------------------------------------------------
-    // Math-Platzhalter-Mechanik: Math komplett aus Turndown raushalten
-    // ---------------------------------------------------------------------
     /** @type {string[]} */
     let MATH_SNIPPETS = [];
 
@@ -93,19 +85,99 @@
     }
 
     // ---------------------------------------------------------------------
-    // Math conversion – oriented on Obsidian Web Clipper:
-    //  - KaTeX (.katex / .katex-display)
-    //  - MathJax v3 (<mjx-container> with assistive <math>)
-    //  - raw <math> MathML
-    //  - script[type="math/tex"] / script[type="math/tex; mode=display"]
-    //
-    // Wir verwandeln alles in Platzhalter (@@MATHi@@), speichern LaTeX
-    // separat und lassen Turndown nur die Platzhalter sehen.
+    // MediaWiki/Wikipedia-Erkennung
+    // ---------------------------------------------------------------------
+    function isMediaWikiMathSite() {
+        return /\.(wikipedia|wikibooks|wikiversity|wiktionary|wikinews|wikivoyage|wikidata|wikimedia)\.org$/.test(location.hostname);
+    }
+
+    // ---------------------------------------------------------------------
+    // MediaWiki/Wikipedia-Math: .mwe-math-element -> Platzhalter
+    //  - Holt TeX bevorzugt aus img.alt / aria-label
+    //  - Optional MathML->LaTeX, aber kein textContent-Fallback
+    //  - Inline vs Display sauber anhand von math@display / Klassen
+    // ---------------------------------------------------------------------
+    function convertMediaWikiMath(root) {
+        if (!isMediaWikiMathSite()) return;
+
+        const mmlConverter = getMathMLToLatex();
+        const wrappers = root.querySelectorAll('.mwe-math-element');
+
+        wrappers.forEach(wrapper => {
+            if (wrapper.__mwMathHandled) return;
+
+            let latex = null;
+
+            // 1) bevorzugt: Bild-Alt / aria-label (enthält sauberes TeX)
+            const img = wrapper.querySelector('img[src*="/media/math/render/"]');
+            if (img) {
+                latex = (img.getAttribute('alt') ||
+                         img.getAttribute('aria-label') ||
+                         '').trim();
+            }
+
+            // 2) optional: MathML -> LaTeX (nur mit Converter)
+            if (!latex) {
+                const mathEl = wrapper.querySelector('math');
+                if (mathEl && mmlConverter) {
+                    try {
+                        latex = (mmlConverter.convert(mathEl.outerHTML) || '').trim();
+                    } catch (e) {
+                        if (DEBUG) console.warn('[AutoMarkdown] MediaWiki MathML convert failed:', e);
+                    }
+                }
+            }
+
+            // kein textContent-Fallback – lieber gar nichts verändern,
+            // als zerhackte {\displaystyle ...}-Strings zu erzeugen
+            if (!latex) return;
+
+            // Inline/Display bestimmen
+            let isInline = true;
+
+            const mathEl = wrapper.querySelector('math');
+            if (mathEl) {
+                const displayAttr = (mathEl.getAttribute('display') || '').toLowerCase();
+                if (displayAttr === 'block') {
+                    isInline = false;
+                }
+            }
+
+            // Klassen der Fallback-Bilder beachten
+            if (wrapper.querySelector('.mwe-math-fallback-image-display')) {
+                isInline = false;
+            }
+            if (wrapper.querySelector('.mwe-math-fallback-image-inline')) {
+                isInline = true;
+            }
+
+            if (DEBUG) console.log('[AutoMarkdown] MediaWiki latex:', latex, 'inline:', isInline);
+
+            const placeholder = createMathPlaceholder(latex, isInline);
+            const textNode = root.ownerDocument.createTextNode(
+                isInline ? placeholder : '\n' + placeholder + '\n'
+            );
+
+            wrapper.__mwMathHandled = true;
+            wrapper.replaceWith(textNode);
+        });
+
+        // Stray-Bild-Math entfernen, damit Turndown keine Markdown-Bilder daraus macht
+        const strayImgs = root.querySelectorAll('img[src*="/media/math/render/"]');
+        strayImgs.forEach(img => {
+            if (!img.closest('.mwe-math-element')) {
+                img.remove();
+            }
+        });
+    }
+
+    // ---------------------------------------------------------------------
+    // Standard-Math (KaTeX, MathJax, bare <math>, script type="math/tex")
     // ---------------------------------------------------------------------
     function convertMathInContainer(root) {
         const mmlConverter = getMathMLToLatex();
 
-        // 1) KaTeX
+        // KaTeX
         const katexSpans = root.querySelectorAll('span.katex');
         katexSpans.forEach(span => {
             try {
@@ -132,19 +204,17 @@
             }
         });
 
-        // 2) MathJax v3
+        // MathJax v3
         const mjxContainers = root.querySelectorAll('mjx-container');
         mjxContainers.forEach(mjx => {
             try {
                 let latex = null;
 
-                // Versuch 1: TeX-Annotation
                 const ann = mjx.querySelector('annotation[encoding="application/x-tex"], annotation[encoding="TeX"]');
                 if (ann && ann.textContent) {
                     latex = ann.textContent.trim();
                 }
 
-                // Versuch 2: MathML -> LaTeX
                 if (!latex) {
                     const mathEl =
                         mjx.querySelector('mjx-assistive-mml > math') ||
@@ -178,7 +248,7 @@
             }
         });
 
-        // 3) Raw MathML <math> (nicht in KaTeX/MathJax)
+        // bare <math> (nicht in KaTeX/MathJax)
         const mathEls = root.querySelectorAll('math');
         mathEls.forEach(mathEl => {
             if (mathEl.closest('mjx-container,.katex-mathml,.katex')) return;
@@ -207,7 +277,7 @@
             }
         });
 
-        // 4) Alte MathJax-Quellen: <script type="math/tex">
+        // script type="math/tex"
         const texScripts = root.querySelectorAll('script[type^="math/tex"]');
         texScripts.forEach(script => {
             if (script.closest('mjx-container,.katex-mathml,.katex')) return;
@@ -233,8 +303,7 @@
     }
 
     // ---------------------------------------------------------------------
-    // Zusatz: rohe \(...\) und \[...\] in Textknoten -> Platzhalter
-    // (damit nicht per Regex nach Turndown gefummelt werden muss)
+    // rohe \(...\) / \[...\] in Text -> Platzhalter
     // ---------------------------------------------------------------------
     function convertInlineTeXTextNodes(root) {
         const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
@@ -287,7 +356,7 @@
     }
 
     // ---------------------------------------------------------------------
-    // Do not trigger inside input/textarea/contentEditable
+    // Editables auslassen
     // ---------------------------------------------------------------------
     function isInEditable(node) {
         while (node) {
@@ -304,7 +373,7 @@
     }
 
     // ---------------------------------------------------------------------
-    // Selection -> Markdown (mit Math-Platzhalter-Strategie)
+    // Selection -> Markdown
     // ---------------------------------------------------------------------
     function selectionToMarkdown() {
         const sel = window.getSelection();
@@ -318,58 +387,57 @@
         const container = document.createElement('div');
         container.appendChild(fragment);
 
-        // Math-Speicher zurücksetzen
         MATH_SNIPPETS = [];
 
-        // 1) Strukturierte Math (KaTeX, MathJax, MathML, script)
+        // 1) Wikipedia/MediaWiki normalisieren
+        convertMediaWikiMath(container);
+
+        // 2) Generelle Math-Pipeline
         convertMathInContainer(container);
 
-        // 2) rohe \(...\) und \[...\] in Textknoten
+        // 3) rohe \(...\)/\[...\]
         convertInlineTeXTextNodes(container);
 
         const html = container.innerHTML;
         if (!html.trim()) return null;
 
         let md = turndownService.turndown(html);
-
-        // Platzhalter zurück in echtes LaTeX
         md = restoreMathPlaceholders(md);
-
         md = md.trim();
 
-        if (DEBUG) {
-            console.log('[AutoMarkdown] FINAL MD:\n', md);
-        }
+        if (DEBUG) console.log('[AutoMarkdown] FINAL MD:\n', md);
 
         return md;
     }
 
-// ---------------------------------------------------------------------
-// Mini Copy-Notifier (kleines Kopiersymbol)
-// ---------------------------------------------------------------------
-function showCopyToast() {
-    const div = document.createElement('div');
-    div.textContent = '⧉';
-    div.style.position = 'fixed';
-    div.style.bottom = '20px';
-    div.style.right = '20px';
-    div.style.fontSize = '26px';
-    div.style.opacity = '0';
-    div.style.transition = 'opacity 0.25s';
-    div.style.zIndex = '999999999';
-
-    document.body.appendChild(div);
-
-    requestAnimationFrame(() => {
-        div.style.opacity = '1';
-    });
-
-    setTimeout(() => {
+    // ---------------------------------------------------------------------
+    // Mini Copy-Toast
+    // ---------------------------------------------------------------------
+    function showCopyToast() {
+        const div = document.createElement('div');
+        div.textContent = '⧉';
+        div.style.position = 'fixed';
+        div.style.bottom = '20px';
+        div.style.right = '20px';
+        div.style.fontSize = '26px';
         div.style.opacity = '0';
-        setTimeout(() => div.remove(), 250);
-    }, 600);
-}
+        div.style.transition = 'opacity 0.25s';
+        div.style.zIndex = '999999999';
+        div.style.userSelect = 'none';
+        div.style.pointerEvents = 'none';
+        div.style.color = 'var(--text-normal, #dadada)';
 
+        document.body.appendChild(div);
+
+        requestAnimationFrame(() => {
+            div.style.opacity = '1';
+        });
+
+        setTimeout(() => {
+            div.style.opacity = '0';
+            setTimeout(() => div.remove(), 250);
+        }, 600);
+    }
 
     // ---------------------------------------------------------------------
     // Auto-copy logic
@@ -379,8 +447,6 @@ function showCopyToast() {
     function handleSelectionEvent() {
         const md = selectionToMarkdown();
         if (!md) return;
-
-        // identisches Ergebnis nicht nochmal kopieren
         if (md === lastCopied) return;
         lastCopied = md;
 
@@ -392,7 +458,6 @@ function showCopyToast() {
         }
     }
 
-    // Trigger: Maus-Selektion + Tastatur-Selektion (Shift+Pfeile etc.)
     document.addEventListener('mouseup', handleSelectionEvent);
     document.addEventListener('keyup', handleSelectionEvent);
 })();
