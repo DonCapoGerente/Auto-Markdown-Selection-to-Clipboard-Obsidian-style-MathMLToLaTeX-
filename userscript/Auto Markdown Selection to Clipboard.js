@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Auto Markdown Selection to Clipboard (Obsidian-style + MathMLToLaTeX + MediaWiki/Wikipedia)
+// @name         Auto Markdown Selection to Clipboard (Obsidian-style + MathMLToLaTeX + MediaWiki/Wikipedia + Universal Code/Math Fixes)
 // @namespace    https://github.com/yourname/userscripts
-// @version      2025.03.20.7
-// @description  Convert selected content to Markdown with proper inline/display LaTeX math, and auto-copy to clipboard (similar to Obsidian Web Clipper behavior). Includes special handling for Wikipedia/MediaWiki math.
+// @version      2026.02.18.3
+// @description  Convert selection to Obsidian-compatible Markdown with robust codeblock + math handling (KaTeX/MathJax/MathML/MediaWiki), list spacing fixes, display-math context expansion, and auto-copy toast.
 // @author       you
 // @license      MIT
 // @match        *://*/*
@@ -17,9 +17,7 @@
 
     const DEBUG = false;
 
-    // ---------------------------------------------------------------------
-    // Turndown setup (HTML -> Markdown) + GFM
-    // ---------------------------------------------------------------------
+    // ---------------- Turndown setup ----------------
     if (typeof TurndownService === 'undefined') {
         console.error('[AutoMarkdown] TurndownService not found. Check @require URLs.');
         return;
@@ -43,9 +41,7 @@
         console.warn('[AutoMarkdown] GFM plugin not found. GFM features disabled.');
     }
 
-    // ---------------------------------------------------------------------
-    // Helper: MathMLToLaTeX
-    // ---------------------------------------------------------------------
+    // ---------------- MathMLToLaTeX helper ----------------
     function getMathMLToLatex() {
         if (typeof MathMLToLaTeX !== 'undefined' && MathMLToLaTeX && typeof MathMLToLaTeX.convert === 'function') {
             return MathMLToLaTeX;
@@ -58,16 +54,13 @@
         return null;
     }
 
-    // ---------------------------------------------------------------------
-    // LaTeX-Wrapping + Platzhalter
-    // ---------------------------------------------------------------------
+    // ---------------- Placeholders: Math ----------------
     function wrapLatex(latex, inline) {
         const txt = (latex || '').trim();
         if (!txt) return '';
         return inline ? `$${txt}$` : `$$\n${txt}\n$$`;
     }
 
-    /** @type {string[]} */
     let MATH_SNIPPETS = [];
 
     function createMathPlaceholder(latex, inline) {
@@ -84,19 +77,41 @@
         });
     }
 
-    // ---------------------------------------------------------------------
-    // MediaWiki/Wikipedia-Erkennung
-    // ---------------------------------------------------------------------
-    function isMediaWikiMathSite() {
-        return /\.(wikipedia|wikibooks|wikiversity|wiktionary|wikinews|wikivoyage|wikidata|wikimedia)\.org$/.test(location.hostname);
+    // ---------------- Placeholders: Code ----------------
+    let CODE_SNIPPETS = [];
+
+    function sanitizeCodeText(codeText) {
+        let t = codeText || '';
+        // Remove common UI strings ONLY at the very beginning (safe, minimal)
+        // Handles cases like "Code kopierenfalse → break" (no newline between)
+        t = t.replace(/^\s*(?:Code\s*kopieren|Copy\s*code)\s*/i, '');
+        // Trim trailing whitespace/newlines
+        t = t.replace(/\n+$/g, '');
+        return t;
     }
 
-    // ---------------------------------------------------------------------
-    // MediaWiki/Wikipedia-Math: .mwe-math-element -> Platzhalter
-    //  - Holt TeX bevorzugt aus img.alt / aria-label
-    //  - Optional MathML->LaTeX, aber kein textContent-Fallback
-    //  - Inline vs Display sauber anhand von math@display / Klassen
-    // ---------------------------------------------------------------------
+    function createCodePlaceholder(codeText, language) {
+        const lang = (language || '').trim();
+        const code = sanitizeCodeText(codeText);
+        const fenced = lang ? `\`\`\`${lang}\n${code}\n\`\`\`` : `\`\`\`\n${code}\n\`\`\``;
+        const idx = CODE_SNIPPETS.length;
+        CODE_SNIPPETS.push(fenced);
+        return `@@CODE${idx}@@`;
+    }
+
+    function restoreCodePlaceholders(md) {
+        return md.replace(/@@CODE(\d+)@@/g, (m, idxStr) => {
+            const idx = Number(idxStr);
+            return CODE_SNIPPETS[idx] || '';
+        });
+    }
+
+    // ---------------- MediaWiki/Wikipedia detection ----------------
+    function isMediaWikiMathSite() {
+        return /\.(wikipedia|wikibooks|wikiversity|wiktionary|wikinews|wikivoyage|wikidata|wikimedia)\.org$/i.test(location.hostname);
+    }
+
+    // ---------------- MediaWiki math conversion ----------------
     function convertMediaWikiMath(root) {
         if (!isMediaWikiMathSite()) return;
 
@@ -108,7 +123,6 @@
 
             let latex = null;
 
-            // 1) bevorzugt: Bild-Alt / aria-label (enthält sauberes TeX)
             const img = wrapper.querySelector('img[src*="/media/math/render/"]');
             if (img) {
                 latex = (img.getAttribute('alt') ||
@@ -116,7 +130,6 @@
                          '').trim();
             }
 
-            // 2) optional: MathML -> LaTeX (nur mit Converter)
             if (!latex) {
                 const mathEl = wrapper.querySelector('math');
                 if (mathEl && mmlConverter) {
@@ -128,52 +141,33 @@
                 }
             }
 
-            // kein textContent-Fallback – lieber gar nichts verändern,
-            // als zerhackte {\displaystyle ...}-Strings zu erzeugen
             if (!latex) return;
 
-            // Inline/Display bestimmen
+            // Inline/Display
             let isInline = true;
-
             const mathEl = wrapper.querySelector('math');
             if (mathEl) {
                 const displayAttr = (mathEl.getAttribute('display') || '').toLowerCase();
-                if (displayAttr === 'block') {
-                    isInline = false;
-                }
+                if (displayAttr === 'block') isInline = false;
             }
-
-            // Klassen der Fallback-Bilder beachten
-            if (wrapper.querySelector('.mwe-math-fallback-image-display')) {
-                isInline = false;
-            }
-            if (wrapper.querySelector('.mwe-math-fallback-image-inline')) {
-                isInline = true;
-            }
-
-            if (DEBUG) console.log('[AutoMarkdown] MediaWiki latex:', latex, 'inline:', isInline);
+            if (wrapper.querySelector('.mwe-math-fallback-image-display')) isInline = false;
+            if (wrapper.querySelector('.mwe-math-fallback-image-inline')) isInline = true;
 
             const placeholder = createMathPlaceholder(latex, isInline);
-            const textNode = root.ownerDocument.createTextNode(
-                isInline ? placeholder : '\n' + placeholder + '\n'
-            );
+            // IMPORTANT: no outer newlines here
+            const textNode = root.ownerDocument.createTextNode(placeholder);
 
             wrapper.__mwMathHandled = true;
             wrapper.replaceWith(textNode);
         });
 
-        // Stray-Bild-Math entfernen, damit Turndown keine Markdown-Bilder daraus macht
         const strayImgs = root.querySelectorAll('img[src*="/media/math/render/"]');
         strayImgs.forEach(img => {
-            if (!img.closest('.mwe-math-element')) {
-                img.remove();
-            }
+            if (!img.closest('.mwe-math-element')) img.remove();
         });
     }
 
-    // ---------------------------------------------------------------------
-    // Standard-Math (KaTeX, MathJax, bare <math>, script type="math/tex")
-    // ---------------------------------------------------------------------
+    // ---------------- General math pipeline ----------------
     function convertMathInContainer(root) {
         const mmlConverter = getMathMLToLatex();
 
@@ -190,14 +184,13 @@
                 const latex = (ann.textContent || '').trim();
                 if (!latex) return;
 
-                const isDisplay = span.closest('.katex-display') !== null;
-
-                if (DEBUG) console.log('[AutoMarkdown] KaTeX latex:', latex, 'display:', isDisplay);
+                // Robust display detection even if wrapper is partially missing
+                const hasDisplayWrapper = span.closest('.katex-display') !== null;
+                const hasBlockMath = span.querySelector('math[display="block"], math[display="true"]') !== null;
+                const isDisplay = hasDisplayWrapper || hasBlockMath;
 
                 const placeholder = createMathPlaceholder(latex, !isDisplay);
-                const textNode = root.ownerDocument.createTextNode(
-                    isDisplay ? '\n' + placeholder + '\n' : placeholder
-                );
+                const textNode = root.ownerDocument.createTextNode(placeholder); // no outer newlines
                 span.replaceWith(textNode);
             } catch (e) {
                 console.warn('[AutoMarkdown] KaTeX conversion failed:', e);
@@ -211,66 +204,50 @@
                 let latex = null;
 
                 const ann = mjx.querySelector('annotation[encoding="application/x-tex"], annotation[encoding="TeX"]');
-                if (ann && ann.textContent) {
-                    latex = ann.textContent.trim();
-                }
+                if (ann && ann.textContent) latex = ann.textContent.trim();
 
                 if (!latex) {
                     const mathEl =
                         mjx.querySelector('mjx-assistive-mml > math') ||
                         mjx.querySelector('math');
                     if (mathEl) {
-                        if (mmlConverter) {
-                            latex = (mmlConverter.convert(mathEl.outerHTML) || '').trim();
-                        } else {
-                            latex = (mathEl.textContent || '').trim();
-                        }
+                        if (mmlConverter) latex = (mmlConverter.convert(mathEl.outerHTML) || '').trim();
+                        else latex = (mathEl.textContent || '').trim();
                     }
                 }
 
                 if (!latex) return;
 
-                const displayAttr = mjx.getAttribute('display') || '';
+                const displayAttr = (mjx.getAttribute('display') || '').toLowerCase();
                 const isDisplay =
                     displayAttr === 'true' ||
                     displayAttr === 'block' ||
                     mjx.closest('[data-display="block"]') !== null;
 
-                if (DEBUG) console.log('[AutoMarkdown] MJX latex:', latex, 'display:', isDisplay);
-
                 const placeholder = createMathPlaceholder(latex, !isDisplay);
-                const textNode = root.ownerDocument.createTextNode(
-                    isDisplay ? '\n' + placeholder + '\n' : placeholder
-                );
+                const textNode = root.ownerDocument.createTextNode(placeholder); // no outer newlines
                 mjx.replaceWith(textNode);
             } catch (e) {
                 console.warn('[AutoMarkdown] MathJax conversion failed:', e);
             }
         });
 
-        // bare <math> (nicht in KaTeX/MathJax)
+        // bare <math>
         const mathEls = root.querySelectorAll('math');
         mathEls.forEach(mathEl => {
             if (mathEl.closest('mjx-container,.katex-mathml,.katex')) return;
 
             try {
                 let latex = null;
-                if (mmlConverter) {
-                    latex = (mmlConverter.convert(mathEl.outerHTML) || '').trim();
-                } else {
-                    latex = (mathEl.textContent || '').trim();
-                }
+                if (mmlConverter) latex = (mmlConverter.convert(mathEl.outerHTML) || '').trim();
+                else latex = (mathEl.textContent || '').trim();
                 if (!latex) return;
 
                 const displayAttr = (mathEl.getAttribute('display') || '').toLowerCase();
                 const isDisplay = displayAttr === 'block' || displayAttr === 'true';
 
-                if (DEBUG) console.log('[AutoMarkdown] bare MathML latex:', latex, 'display:', isDisplay);
-
                 const placeholder = createMathPlaceholder(latex, !isDisplay);
-                const textNode = root.ownerDocument.createTextNode(
-                    isDisplay ? '\n' + placeholder + '\n' : placeholder
-                );
+                const textNode = root.ownerDocument.createTextNode(placeholder); // no outer newlines
                 mathEl.replaceWith(textNode);
             } catch (e) {
                 console.warn('[AutoMarkdown] bare MathML conversion failed:', e);
@@ -289,12 +266,8 @@
                 const latex = (script.textContent || '').trim();
                 if (!latex) return;
 
-                if (DEBUG) console.log('[AutoMarkdown] <script math/tex> latex:', latex, 'display:', isDisplay);
-
                 const placeholder = createMathPlaceholder(latex, !isDisplay);
-                const textNode = root.ownerDocument.createTextNode(
-                    isDisplay ? '\n' + placeholder + '\n' : placeholder
-                );
+                const textNode = root.ownerDocument.createTextNode(placeholder); // no outer newlines
                 script.replaceWith(textNode);
             } catch (e) {
                 console.warn('[AutoMarkdown] <script math/tex> conversion failed:', e);
@@ -302,18 +275,21 @@
         });
     }
 
-    // ---------------------------------------------------------------------
-    // rohe \(...\) / \[...\] in Text -> Platzhalter
-    // ---------------------------------------------------------------------
+    // ---------------- Raw TeX markers in text nodes ----------------
     function convertInlineTeXTextNodes(root) {
         const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
         const textNodes = [];
         let node;
+
         while ((node = walker.nextNode())) {
             if (!node.nodeValue) continue;
-            if (!node.nodeValue.includes('\\(') && !node.nodeValue.includes('\\[')) continue;
-            textNodes.push(node);
+            const val = node.nodeValue;
+            if (val.includes('\\(') || val.includes('\\[') || val.includes('$$')) {
+                textNodes.push(node);
+            }
         }
+
+        const texRegex = /\\\((.+?)\\\)|\\\[([\s\S]+?)\\\]|\$\$([\s\S]+?)\$\$/g;
 
         textNodes.forEach(textNode => {
             const text = textNode.nodeValue;
@@ -321,30 +297,34 @@
             if (!parent) return;
 
             const frag = document.createDocumentFragment();
-            const regex = /\\\((.+?)\\\)|\\\[([\s\S]+?)\\\]/g;
             let lastIndex = 0;
             let m;
 
-            while ((m = regex.exec(text)) !== null) {
+            while ((m = texRegex.exec(text)) !== null) {
                 const index = m.index;
                 if (index > lastIndex) {
                     frag.appendChild(document.createTextNode(text.slice(lastIndex, index)));
                 }
 
                 const inlineContent = m[1];
-                const displayContent = m[2];
+                const displayContentBracket = m[2];
+                const displayContentDollar = m[3];
 
                 if (inlineContent != null) {
                     const latex = inlineContent.trim();
                     const placeholder = createMathPlaceholder(latex, true);
                     frag.appendChild(document.createTextNode(placeholder));
-                } else if (displayContent != null) {
-                    const latex = displayContent.trim();
+                } else if (displayContentBracket != null) {
+                    const latex = displayContentBracket.trim();
                     const placeholder = createMathPlaceholder(latex, false);
-                    frag.appendChild(document.createTextNode('\n' + placeholder + '\n'));
+                    frag.appendChild(document.createTextNode(placeholder));
+                } else if (displayContentDollar != null) {
+                    const latex = displayContentDollar.trim();
+                    const placeholder = createMathPlaceholder(latex, false);
+                    frag.appendChild(document.createTextNode(placeholder));
                 }
 
-                lastIndex = regex.lastIndex;
+                lastIndex = texRegex.lastIndex;
             }
 
             if (lastIndex < text.length) {
@@ -355,13 +335,11 @@
         });
     }
 
-    // ---------------------------------------------------------------------
-    // Editables auslassen
-    // ---------------------------------------------------------------------
+    // ---------------- Skip editables ----------------
     function isInEditable(node) {
         while (node) {
             if (node.nodeType === Node.ELEMENT_NODE) {
-                const el = /** @type {HTMLElement} */ (node);
+                const el = node;
                 const tag = el.tagName;
                 if (tag === 'INPUT' || tag === 'TEXTAREA' || el.isContentEditable) {
                     return true;
@@ -372,30 +350,114 @@
         return false;
     }
 
-    // ---------------------------------------------------------------------
-    // Selection -> Markdown
-    // ---------------------------------------------------------------------
+    // ---------------- Universal code block conversion ----------------
+    function convertCodeBlocks(root) {
+        const pres = root.querySelectorAll('pre');
+        pres.forEach(pre => {
+            if (pre.__codeHandled) return;
+
+            let codeEl = pre.querySelector('code');
+            let lang = '';
+
+            function extractLangFrom(el) {
+                const classes = Array.from((el && el.classList) || []);
+                for (const cls of classes) {
+                    const match = cls.match(/^(?:language-|lang-|language_)([a-zA-Z0-9+-]+)/);
+                    if (match) return match[1];
+                }
+                const dataLang = el && (el.getAttribute('data-language') || el.getAttribute('data-lang'));
+                if (dataLang) return dataLang;
+                return '';
+            }
+
+            if (codeEl) {
+                lang = extractLangFrom(codeEl);
+            } else {
+                const ancestorCode = pre.closest('code');
+                if (ancestorCode) lang = extractLangFrom(ancestorCode);
+            }
+            if (!lang) lang = extractLangFrom(pre);
+
+            const codeText = pre.textContent || '';
+            if (!codeText.trim()) return;
+
+            const placeholder = createCodePlaceholder(codeText, lang);
+            const textNode = root.ownerDocument.createTextNode(placeholder);
+            pre.__codeHandled = true;
+            pre.replaceWith(textNode);
+        });
+    }
+
+    // ---------------- Postprocessing: list spacing ----------------
+    function collapseListSpacing(md) {
+        return md.replace(/\n\s*\n(?=\s*(?:[-*+]\s|\d+\.\s))/g, '\n');
+    }
+
+    // ---------------- Postprocessing: remove extra padding around fences ($$ and ```) ----------------
+    function collapseFencePadding(md) {
+        // Normalize CRLF
+        let out = md.replace(/\r\n/g, '\n');
+
+        // Remove a single *extra* blank line before opening code fence
+        out = out.replace(/([^\n])\n{2,}```/g, '$1\n```');
+        // Remove a single *extra* blank line after closing code fence
+        out = out.replace(/```\n{2,}([^\n])/g, '```\n$1');
+
+        // Same for display math fences
+        out = out.replace(/([^\n])\n{2,}\$\$/g, '$1\n$$');
+        out = out.replace(/\$\$\n{2,}([^\n])/g, '$$\n$1');
+
+        // Finally, collapse pathological runs of 3+ newlines to 2 (keeps readability)
+        out = out.replace(/\n{3,}/g, '\n\n');
+
+        return out;
+    }
+
+    // ---------------- Selection -> Markdown (with math context expansion) ----------------
     function selectionToMarkdown() {
         const sel = window.getSelection();
         if (!sel || sel.isCollapsed || sel.rangeCount === 0) return null;
 
-        const range = sel.getRangeAt(0);
+        let range = sel.getRangeAt(0);
         const ancestor = range.commonAncestorContainer;
         if (isInEditable(ancestor)) return null;
+
+        // Expand range edges if start/end lie inside math containers.
+        // Prefer display wrappers first to preserve display-mode.
+        try {
+            const pickMathContainer = (el) => {
+                if (!el || !el.closest) return null;
+                return el.closest(
+                    'span.katex-display,' +
+                    'mjx-container[display="true"],mjx-container[display="block"],mjx-container[display],' +
+                    'math[display="block"],math[display="true"],' +
+                    '.mwe-math-element,' +
+                    'span.katex,mjx-container,math'
+                );
+            };
+
+            const startEl = (range.startContainer.nodeType === Node.TEXT_NODE ? range.startContainer.parentElement : range.startContainer);
+            const endEl = (range.endContainer.nodeType === Node.TEXT_NODE ? range.endContainer.parentElement : range.endContainer);
+
+            const startMath = pickMathContainer(startEl);
+            const endMath = pickMathContainer(endEl);
+
+            if (startMath) range.setStartBefore(startMath);
+            if (endMath) range.setEndAfter(endMath);
+        } catch (e) {
+            // ignore
+        }
 
         const fragment = range.cloneContents();
         const container = document.createElement('div');
         container.appendChild(fragment);
 
         MATH_SNIPPETS = [];
+        CODE_SNIPPETS = [];
 
-        // 1) Wikipedia/MediaWiki normalisieren
+        convertCodeBlocks(container);
         convertMediaWikiMath(container);
-
-        // 2) Generelle Math-Pipeline
         convertMathInContainer(container);
-
-        // 3) rohe \(...\)/\[...\]
         convertInlineTeXTextNodes(container);
 
         const html = container.innerHTML;
@@ -403,6 +465,9 @@
 
         let md = turndownService.turndown(html);
         md = restoreMathPlaceholders(md);
+        md = restoreCodePlaceholders(md);
+        md = collapseListSpacing(md);
+        md = collapseFencePadding(md);
         md = md.trim();
 
         if (DEBUG) console.log('[AutoMarkdown] FINAL MD:\n', md);
@@ -410,9 +475,7 @@
         return md;
     }
 
-    // ---------------------------------------------------------------------
-    // Mini Copy-Toast
-    // ---------------------------------------------------------------------
+    // ---------------- Copy toast ----------------
     function showCopyToast() {
         const div = document.createElement('div');
         div.textContent = '⧉';
@@ -429,9 +492,7 @@
 
         document.body.appendChild(div);
 
-        requestAnimationFrame(() => {
-            div.style.opacity = '1';
-        });
+        requestAnimationFrame(() => { div.style.opacity = '1'; });
 
         setTimeout(() => {
             div.style.opacity = '0';
@@ -439,9 +500,7 @@
         }, 600);
     }
 
-    // ---------------------------------------------------------------------
-    // Auto-copy logic
-    // ---------------------------------------------------------------------
+    // ---------------- Auto-copy logic ----------------
     let lastCopied = '';
 
     function handleSelectionEvent() {
