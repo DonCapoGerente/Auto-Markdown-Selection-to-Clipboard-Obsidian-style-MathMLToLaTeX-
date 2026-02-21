@@ -1,531 +1,561 @@
 // ==UserScript==
-// @name         Auto Markdown Selection to Clipboard (Obsidian-style + MathMLToLaTeX + MediaWiki/Wikipedia + Universal Code/Math Fixes)
-// @namespace    https://github.com/yourname/userscripts
-// @version      2026.02.18.4
-// @description  Convert selection to Obsidian-compatible Markdown with robust codeblock + math handling (KaTeX/MathJax/MathML/MediaWiki), list spacing fixes, display-math context expansion, and auto-copy toast.
-// @author       you
-// @license      MIT
+// @name         AutoCopy Markdown (Obsidian-like + MediaWiki Math display fixed)
+// @namespace    mdclipper.autocopy
+// @version      2.4.0
+// @description  Selection -> sanitize (preserve MathML) -> turndown(GFM) with MediaWiki math rule -> postprocess -> clipboard + toast.
 // @match        *://*/*
 // @grant        GM_setClipboard
-// @require      https://unpkg.com/turndown/dist/turndown.js
-// @require      https://unpkg.com/@guyplusplus/turndown-plugin-gfm/dist/turndown-plugin-gfm.js
-// @require      https://unpkg.com/mathml-to-latex@1.5.0/dist/index.umd.js
+// @grant        GM.setClipboard
+// @run-at       document-idle
+// @require      https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js
+// @require      https://cdn.jsdelivr.net/npm/turndown@7.2.0/dist/turndown.js
+// @require      https://cdn.jsdelivr.net/npm/turndown-plugin-gfm@1.0.3/dist/turndown-plugin-gfm.js
+// @require      https://cdn.jsdelivr.net/npm/mathml-to-latex@1.5.0/dist/mathml-to-latex.min.js
 // ==/UserScript==
 
 (function () {
   'use strict';
 
-  const DEBUG = false;
+  const Policies = Object.freeze({
+    debug: false,
+    debounceMs: 120,
+    cooldownMs: 80,
 
-  // ---------------- Turndown setup ----------------
-  if (typeof TurndownService === 'undefined') {
-    console.error('[AutoMarkdown] TurndownService not found. Check @require URLs.');
-    return;
-  }
+    preferGMSetClipboardSync: true,
 
-  const turndownService = new TurndownService({
-    codeBlockStyle: 'fenced',
-    headingStyle: 'atx'
+    tightLists: true,
+    adjacentDisplayMathTight: true,
+    blanklineMax: 1,
+
+    sanitizeWithDOMPurify: true,
+
+    // MediaWiki / Wikipedia math
+    wikipediaPreferTexAnnotation: true,
+    wikipediaRemoveResidualMathImagesAfterExtract: true,
   });
 
-  let gfmPlugin = null;
-  if (typeof turndownPluginGfm !== 'undefined') {
-    gfmPlugin = turndownPluginGfm;
-  } else if (typeof TurndownPluginGfmService !== 'undefined') {
-    gfmPlugin = TurndownPluginGfmService;
+  const Log = {
+    d: (...a) => Policies.debug && console.debug('[mdclip]', ...a),
+    w: (...a) => console.warn('[mdclip]', ...a),
+  };
+
+  function normalizeInvisibleUnicode(s) {
+    return (s || '').replace(/[\u200B-\u200D\uFEFF]/g, '');
   }
 
-  if (gfmPlugin && typeof gfmPlugin.gfm === 'function') {
-    turndownService.use(gfmPlugin.gfm);
-  } else {
-    console.warn('[AutoMarkdown] GFM plugin not found. GFM features disabled.');
-  }
-
-  // ---------------- MathMLToLaTeX helper ----------------
-  function getMathMLToLatex() {
-    if (typeof MathMLToLaTeX !== 'undefined' && MathMLToLaTeX && typeof MathMLToLaTeX.convert === 'function') {
-      return MathMLToLaTeX;
+  function stableHash(str) {
+    let h = 2166136261;
+    for (let i = 0; i < str.length; i++) {
+      h ^= str.charCodeAt(i);
+      h = Math.imul(h, 16777619);
     }
-    if (typeof window !== 'undefined' &&
-      window.MathMLToLaTeX &&
-      typeof window.MathMLToLaTeX.convert === 'function') {
-      return window.MathMLToLaTeX;
+    return (h >>> 0).toString(16);
+  }
+
+  function isEditableTarget(node) {
+    const el = node?.nodeType === 1 ? node : node?.parentElement;
+    if (!el) return false;
+    return !!el.closest('input, textarea, [contenteditable=""], [contenteditable="true"], [contenteditable="plaintext-only"]');
+  }
+
+  class ToastService {
+    constructor() { this.el = null; this.timer = null; }
+    show(msg, ok = true) {
+      if (!this.el) this.el = this._create();
+      this.el.textContent = msg;
+      this.el.style.opacity = '1';
+      this.el.style.transform = 'translateY(0px)';
+      this.el.dataset.state = ok ? 'ok' : 'fail';
+      clearTimeout(this.timer);
+      this.timer = setTimeout(() => {
+        this.el.style.opacity = '0';
+        this.el.style.transform = 'translateY(6px)';
+      }, 900);
     }
-    return null;
-  }
-
-  // ---------------- Placeholders: Math ----------------
-  function wrapLatex(latex, inline) {
-    const txt = (latex || '').trim();
-    if (!txt) return '';
-    return inline ? `$${txt}$` : `$$\n${txt}\n$$`;
-  }
-
-  let MATH_SNIPPETS = [];
-  function createMathPlaceholder(latex, inline) {
-    const wrapped = wrapLatex(latex, inline);
-    const idx = MATH_SNIPPETS.length;
-    MATH_SNIPPETS.push(wrapped);
-    return `@@MATH${idx}@@`;
-  }
-  function restoreMathPlaceholders(md) {
-    return md.replace(/@@MATH(\d+)@@/g, (m, idxStr) => MATH_SNIPPETS[Number(idxStr)] || '');
-  }
-
-  // ---------------- Placeholders: Code ----------------
-  let CODE_SNIPPETS = [];
-
-  function sanitizeCodeText(codeText) {
-    let t = codeText || '';
-    t = t.replace(/^\s*(?:Code\s*kopieren|Copy\s*code)\s*/i, '');
-    t = t.replace(/\n+$/g, '');
-    return t;
-  }
-
-  function createCodePlaceholder(codeText, language) {
-    const lang = (language || '').trim();
-    const code = sanitizeCodeText(codeText);
-    const fenced = lang ? `\`\`\`${lang}\n${code}\n\`\`\`` : `\`\`\`\n${code}\n\`\`\``;
-    const idx = CODE_SNIPPETS.length;
-    CODE_SNIPPETS.push(fenced);
-    return `@@CODE${idx}@@`;
-  }
-
-  function restoreCodePlaceholders(md) {
-    return md.replace(/@@CODE(\d+)@@/g, (m, idxStr) => CODE_SNIPPETS[Number(idxStr)] || '');
-  }
-
-  // ---------------- MediaWiki/Wikipedia detection ----------------
-  function isMediaWikiMathSite() {
-    return /\.(wikipedia|wikibooks|wikiversity|wiktionary|wikinews|wikivoyage|wikidata|wikimedia)\.org$/i.test(location.hostname);
-  }
-
-  // Mirrors/wrappers: detect via DOM signatures instead of hostname
-  function hasMediaWikiMathMarkup(root) {
-    try {
-      return !!(
-        root.querySelector('.mwe-math-element') ||
-        root.querySelector('img[src*="/media/math/render/"]') ||
-        root.querySelector('img[src*="wikimedia.org/api/rest_v1/media/math/render"]') ||
-        root.querySelector('img[src*="media/math/render/svg"]')
-      );
-    } catch {
-      return false;
+    _create() {
+      const n = document.createElement('div');
+      n.id = '__mdclip_toast';
+      n.style.cssText = [
+        'position:fixed','right:16px','bottom:16px',
+        'z-index:2147483647','pointer-events:none',
+        'max-width:60vw','padding:10px 12px','border-radius:10px',
+        'font:12px/1.35 system-ui,-apple-system,Segoe UI,Roboto,sans-serif',
+        'box-shadow:0 6px 18px rgba(0,0,0,0.18)',
+        'background:rgba(20,20,20,0.92)','color:white',
+        'opacity:0','transform:translateY(6px)',
+        'transition:opacity 160ms ease, transform 160ms ease',
+        'white-space:pre-wrap'
+      ].join(';');
+      document.documentElement.appendChild(n);
+      return n;
     }
   }
+  const toast = new ToastService();
 
-  function isWikimediaMathRenderImg(img) {
-    const src = (img.getAttribute('src') || '');
-    return (
-      src.includes('/media/math/render/') ||
-      src.includes('wikimedia.org/api/rest_v1/media/math/render') ||
-      src.includes('media/math/render/svg')
-    );
-  }
-
-  // ---------------- MediaWiki math conversion (robust, incl. mirrors) ----------------
-  function convertMediaWikiMath(root) {
-    if (!isMediaWikiMathSite() && !hasMediaWikiMathMarkup(root)) return;
-
-    const mmlConverter = getMathMLToLatex();
-
-    // 1) canonical: .mwe-math-element wrappers
-    const wrappers = root.querySelectorAll('.mwe-math-element');
-    wrappers.forEach(wrapper => {
-      if (wrapper.__mwMathHandled) return;
-
-      let latex = null;
-
-      // Prefer render-image alt/aria-label (clean TeX)
-      const img = wrapper.querySelector('img');
-      if (img && isWikimediaMathRenderImg(img)) {
-        latex = (img.getAttribute('alt') || img.getAttribute('aria-label') || '').trim();
+  class ClipboardService {
+    writeNow(text) {
+      if (Policies.preferGMSetClipboardSync) {
+        try {
+          if (typeof GM_setClipboard === 'function') {
+            GM_setClipboard(text, { type: 'text', mimetype: 'text/plain' });
+            return { started: true, immediateOk: true };
+          }
+        } catch (e) { Log.d('GM_setClipboard failed', e); }
       }
+      try {
+        if (typeof GM !== 'undefined' && typeof GM.setClipboard === 'function') {
+          const p = Promise.resolve(GM.setClipboard(text, { type: 'text', mimetype: 'text/plain' }))
+            .then(() => true).catch(() => false);
+          return { started: true, promise: p };
+        }
+      } catch (e) { Log.d('GM.setClipboard failed', e); }
 
-      // Optional: MathML -> LaTeX if available
-      if (!latex) {
-        const mathEl = wrapper.querySelector('math');
-        if (mathEl && mmlConverter) {
-          try {
-            latex = (mmlConverter.convert(mathEl.outerHTML) || '').trim();
-          } catch (e) {
-            if (DEBUG) console.warn('[AutoMarkdown] MediaWiki MathML convert failed:', e);
+      try {
+        if (navigator.clipboard?.writeText) {
+          const p = navigator.clipboard.writeText(text).then(() => true).catch(() => false);
+          return { started: true, promise: p };
+        }
+      } catch (e) { Log.d('navigator.clipboard failed', e); }
+
+      return { started: false };
+    }
+  }
+  const clipboard = new ClipboardService();
+
+  class SelectionCapture {
+    getPrimaryRange() {
+      const sel = window.getSelection();
+      if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return null;
+
+      try {
+        if (typeof sel.getComposedRanges === 'function') {
+          const ranges = sel.getComposedRanges();
+          if (ranges && ranges.length) {
+            const sr = ranges[0];
+            const r = document.createRange();
+            r.setStart(sr.startContainer, sr.startOffset);
+            r.setEnd(sr.endContainer, sr.endOffset);
+            return r;
           }
         }
+      } catch {}
+
+      try { return sel.getRangeAt(0); } catch { return null; }
+    }
+
+    cloneFragment(range) {
+      const frag = range.cloneContents();
+      const div = document.createElement('div');
+      div.appendChild(frag);
+      return div;
+    }
+  }
+  const capture = new SelectionCapture();
+
+  class DOMSanitizer {
+    sanitize(container) {
+      container.querySelectorAll('script, style, noscript, textarea').forEach(n => n.remove());
+
+      if (Policies.sanitizeWithDOMPurify && window.DOMPurify) {
+        // Preserve MathML/SVG/HTML; also keep MediaWiki-relevant attrs.
+        // ADD_ATTR matters: some setups otherwise drop typeof/alttext/aria-label which are used for TeX extraction.
+        const cleanFrag = window.DOMPurify.sanitize(container, {
+          RETURN_DOM_FRAGMENT: true,
+          USE_PROFILES: { html: true, mathMl: true, svg: true, svgFilters: true },
+          ADD_ATTR: ['class', 'id', 'href', 'src', 'alt', 'aria-label', 'typeof', 'alttext', 'data-latex', 'display'],
+          FORBID_TAGS: ['script', 'style', 'iframe', 'object', 'embed', 'link', 'meta', 'base'],
+          FORBID_ATTR: ['style', 'onload', 'onerror', 'onclick', 'onmouseover', 'onmouseenter', 'onmouseleave']
+        });
+
+        container.innerHTML = '';
+        container.appendChild(cleanFrag);
       }
 
-      // No textContent fallback (prevents {\displaystyle ...} garbage)
-      if (!latex) return;
+      const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+      const nodes = [];
+      while (walker.nextNode()) nodes.push(walker.currentNode);
+      for (const n of nodes) n.nodeValue = normalizeInvisibleUnicode(n.nodeValue || '');
 
-      // Inline/Display from math@display and/or fallback image classes
-      let isInline = true;
+      return container;
+    }
+  }
+  const sanitizer = new DOMSanitizer();
 
-      const mathEl = wrapper.querySelector('math');
-      if (mathEl) {
-        const displayAttr = (mathEl.getAttribute('display') || '').toLowerCase();
-        if (displayAttr === 'block') isInline = false;
-      }
-      if (wrapper.querySelector('.mwe-math-fallback-image-display')) isInline = false;
-      if (wrapper.querySelector('.mwe-math-fallback-image-inline')) isInline = true;
-
-      const placeholder = createMathPlaceholder(latex, isInline);
-      wrapper.__mwMathHandled = true;
-      wrapper.replaceWith(root.ownerDocument.createTextNode(placeholder));
-    });
-
-    // 2) mirrors: standalone render images with TeX in alt
-    const mwImgs = root.querySelectorAll('img');
-    mwImgs.forEach(img => {
-      if (!isWikimediaMathRenderImg(img)) return;
-
-      // already handled if wrapper got replaced
-      if (img.closest('.mwe-math-element')) return;
-
-      const latex = (img.getAttribute('alt') || img.getAttribute('aria-label') || '').trim();
-      if (!latex) return;
-
-      const isDisplay = img.classList.contains('mwe-math-fallback-image-display');
-      const placeholder = createMathPlaceholder(latex, !isDisplay);
-      img.replaceWith(root.ownerDocument.createTextNode(placeholder));
-    });
-
-    // 3) hard guarantee: remove any leftover render images so Turndown never emits ![](...)
-    const leftovers = root.querySelectorAll('img');
-    leftovers.forEach(img => {
-      if (isWikimediaMathRenderImg(img)) img.remove();
-    });
+  function detectCodeLanguage(codeEl, preEl) {
+    const cls = (codeEl.getAttribute('class') || '') + ' ' + (preEl?.getAttribute?.('class') || '');
+    const m = cls.match(/(?:language|lang)-([a-z0-9_+-]+)/i);
+    return m ? m[1].toLowerCase() : '';
   }
 
-  // ---------------- General math pipeline ----------------
-  function convertMathInContainer(root) {
-    const mmlConverter = getMathMLToLatex();
-
-    // KaTeX
-    const katexSpans = root.querySelectorAll('span.katex');
-    katexSpans.forEach(span => {
-      try {
-        const ann = span.querySelector(
-          '.katex-mathml annotation[encoding="application/x-tex"],' +
-          '.katex-mathml annotation[encoding="TeX"]'
-        );
-        if (!ann) return;
-
-        const latex = (ann.textContent || '').trim();
-        if (!latex) return;
-
-        const hasDisplayWrapper = span.closest('.katex-display') !== null;
-        const hasBlockMath = span.querySelector('math[display="block"], math[display="true"]') !== null;
-        const isDisplay = hasDisplayWrapper || hasBlockMath;
-
-        const placeholder = createMathPlaceholder(latex, !isDisplay);
-        span.replaceWith(root.ownerDocument.createTextNode(placeholder));
-      } catch (e) {
-        console.warn('[AutoMarkdown] KaTeX conversion failed:', e);
-      }
-    });
-
-    // MathJax v3
-    const mjxContainers = root.querySelectorAll('mjx-container');
-    mjxContainers.forEach(mjx => {
-      try {
-        let latex = null;
-
-        const ann = mjx.querySelector('annotation[encoding="application/x-tex"], annotation[encoding="TeX"]');
-        if (ann && ann.textContent) latex = ann.textContent.trim();
-
-        if (!latex) {
-          const mathEl =
-            mjx.querySelector('mjx-assistive-mml > math') ||
-            mjx.querySelector('math');
-          if (mathEl) {
-            if (mmlConverter) latex = (mmlConverter.convert(mathEl.outerHTML) || '').trim();
-            else latex = (mathEl.textContent || '').trim();
-          }
-        }
-
-        if (!latex) return;
-
-        const displayAttr = (mjx.getAttribute('display') || '').toLowerCase();
-        const isDisplay =
-          displayAttr === 'true' ||
-          displayAttr === 'block' ||
-          mjx.closest('[data-display="block"]') !== null;
-
-        const placeholder = createMathPlaceholder(latex, !isDisplay);
-        mjx.replaceWith(root.ownerDocument.createTextNode(placeholder));
-      } catch (e) {
-        console.warn('[AutoMarkdown] MathJax conversion failed:', e);
-      }
-    });
-
-    // bare <math>
-    const mathEls = root.querySelectorAll('math');
-    mathEls.forEach(mathEl => {
-      if (mathEl.closest('mjx-container,.katex-mathml,.katex,.mwe-math-element')) return;
-
-      try {
-        let latex = null;
-        if (mmlConverter) latex = (mmlConverter.convert(mathEl.outerHTML) || '').trim();
-        else latex = (mathEl.textContent || '').trim();
-        if (!latex) return;
-
-        const displayAttr = (mathEl.getAttribute('display') || '').toLowerCase();
-        const isDisplay = displayAttr === 'block' || displayAttr === 'true';
-
-        const placeholder = createMathPlaceholder(latex, !isDisplay);
-        mathEl.replaceWith(root.ownerDocument.createTextNode(placeholder));
-      } catch (e) {
-        console.warn('[AutoMarkdown] bare MathML conversion failed:', e);
-      }
-    });
-
-    // script type="math/tex"
-    const texScripts = root.querySelectorAll('script[type^="math/tex"]');
-    texScripts.forEach(script => {
-      if (script.closest('mjx-container,.katex-mathml,.katex,.mwe-math-element')) return;
-
-      try {
-        const typeAttr = script.getAttribute('type') || '';
-        const isDisplay = /mode\s*=\s*display/i.test(typeAttr);
-
-        const latex = (script.textContent || '').trim();
-        if (!latex) return;
-
-        const placeholder = createMathPlaceholder(latex, !isDisplay);
-        script.replaceWith(root.ownerDocument.createTextNode(placeholder));
-      } catch (e) {
-        console.warn('[AutoMarkdown] <script math/tex> conversion failed:', e);
-      }
-    });
+  function fenceCode(raw, lang) {
+    const body = (raw || '').replace(/\s+$/g, '');
+    return `\n\`\`\`${lang || ''}\n${body}\n\`\`\`\n`;
   }
 
-  // ---------------- Raw TeX markers in text nodes ----------------
-  function convertInlineTeXTextNodes(root) {
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-    const textNodes = [];
-    let node;
+  function stripOuterBalancedBracesOnce(s) {
+    s = (s || '').trim();
+    if (!(s.startsWith('{') && s.endsWith('}'))) return s;
 
-    while ((node = walker.nextNode())) {
-      if (!node.nodeValue) continue;
-      const val = node.nodeValue;
-      if (val.includes('\\(') || val.includes('\\[') || val.includes('$$')) {
-        textNodes.push(node);
+    let depth = 0;
+    for (let i = 0; i < s.length; i++) {
+      const ch = s[i];
+      if (ch === '{') depth++;
+      else if (ch === '}') depth--;
+      if (depth === 0 && i < s.length - 1) return s; // closes early -> not a wrapper
+      if (depth < 0) return s;
+    }
+    if (depth !== 0) return s;
+    return s.slice(1, -1);
+  }
+
+  // Your rule: remove \displaystyle + outer {...}; if displaystyle was present -> force display $$...$$.
+  function normalizeWikiTex(texRaw) {
+    let s = (texRaw || '').trim();
+    if (!s) return { latex: '', forceDisplay: false };
+
+    s = stripOuterBalancedBracesOnce(s).trim();
+
+    let forceDisplay = false;
+    for (let i = 0; i < 3; i++) {
+      const before = s;
+      s = stripOuterBalancedBracesOnce(s).trim();
+
+      if (/^\\displaystyle\b/.test(s)) {
+        forceDisplay = true;
+        s = s.replace(/^\\displaystyle\b\s*/, '').trim();
+        continue;
+      }
+      if (/^\{\s*\\displaystyle\b/.test(s) && s.endsWith('}')) {
+        forceDisplay = true;
+        s = s.replace(/^\{\s*\\displaystyle\b\s*/, '').replace(/\}\s*$/, '').trim();
+        continue;
+      }
+      if (s === before) break;
+    }
+
+    if (/^\\textstyle\b/.test(s)) s = s.replace(/^\\textstyle\b\s*/, '').trim();
+
+    return { latex: s.trim(), forceDisplay };
+  }
+
+  function getMathMLToLatexConverter() {
+    // mathml-to-latex UMD can expose different globals depending on bundle
+    const fn = (window.mathmlToLatex && window.mathmlToLatex.convert) ? window.mathmlToLatex.convert
+      : (window.MathMLToLaTeX && typeof window.MathMLToLaTeX.convert === 'function') ? window.MathMLToLaTeX.convert
+      : (typeof window.MathMLToLaTeX === 'function') ? window.MathMLToLaTeX
+      : null;
+    return fn;
+  }
+
+  function extractLatexFromElement(node) {
+    if (!(node instanceof Element)) return '';
+
+    // 1) <math data-latex|alttext>
+    if (node.nodeName.toLowerCase() === 'math') {
+      const dl = node.getAttribute('data-latex');
+      const alttext = node.getAttribute('alttext');
+      if (dl) return dl.trim();
+      if (alttext) return alttext.trim();
+    }
+
+    // 2) nested <math alttext>
+    const mathAlt = node.querySelector('math[alttext]');
+    if (mathAlt) {
+      const alttext = mathAlt.getAttribute('alttext');
+      if (alttext) return alttext.trim();
+    }
+
+    // 3) TeX annotation (best on MediaWiki/KaTeX/MathJax assistive MML)
+    if (Policies.wikipediaPreferTexAnnotation) {
+      const ann = node.querySelector('annotation[encoding="application/x-tex"], annotation[encoding="TeX"]');
+      const tex = ann?.textContent?.trim();
+      if (tex) return tex;
+    }
+
+    // 4) MathML -> LaTeX
+    const mathNode = node.nodeName.toLowerCase() === 'math' ? node : node.querySelector('math');
+    if (mathNode) {
+      const conv = getMathMLToLatexConverter();
+      if (conv) {
+        try { return String(conv(mathNode.outerHTML)).trim(); }
+        catch (e) { Log.d('MathML->LaTeX failed', e); }
       }
     }
 
-    const texRegex = /\\\((.+?)\\\)|\\\[([\s\S]+?)\\\]|\$\$([\s\S]+?)\$\$/g;
-
-    textNodes.forEach(textNode => {
-      const text = textNode.nodeValue;
-      const parent = textNode.parentNode;
-      if (!parent) return;
-
-      const frag = document.createDocumentFragment();
-      let lastIndex = 0;
-      let m;
-
-      while ((m = texRegex.exec(text)) !== null) {
-        const index = m.index;
-        if (index > lastIndex) {
-          frag.appendChild(document.createTextNode(text.slice(lastIndex, index)));
-        }
-
-        const inlineContent = m[1];
-        const displayContentBracket = m[2];
-        const displayContentDollar = m[3];
-
-        if (inlineContent != null) {
-          const latex = inlineContent.trim();
-          frag.appendChild(document.createTextNode(createMathPlaceholder(latex, true)));
-        } else if (displayContentBracket != null) {
-          const latex = displayContentBracket.trim();
-          frag.appendChild(document.createTextNode(createMathPlaceholder(latex, false)));
-        } else if (displayContentDollar != null) {
-          const latex = displayContentDollar.trim();
-          frag.appendChild(document.createTextNode(createMathPlaceholder(latex, false)));
-        }
-
-        lastIndex = texRegex.lastIndex;
-      }
-
-      if (lastIndex < text.length) {
-        frag.appendChild(document.createTextNode(text.slice(lastIndex)));
-      }
-
-      parent.replaceChild(frag, textNode);
-    });
-  }
-
-  // ---------------- Skip editables ----------------
-  function isInEditable(node) {
-    while (node) {
-      if (node.nodeType === Node.ELEMENT_NODE) {
-        const el = node;
-        const tag = el.tagName;
-        if (tag === 'INPUT' || tag === 'TEXTAREA' || el.isContentEditable) return true;
-      }
-      node = node.parentNode;
+    // 5) MediaWiki fallback img alt/aria-label
+    const img = node.nodeName.toLowerCase() === 'img' ? node : node.querySelector('img');
+    if (img) {
+      return (img.getAttribute('alt') || img.getAttribute('aria-label') || '').trim();
     }
-    return false;
+    return '';
   }
 
-  // ---------------- Universal code block conversion ----------------
-  function convertCodeBlocks(root) {
-    const pres = root.querySelectorAll('pre');
-    pres.forEach(pre => {
-      if (pre.__codeHandled) return;
+  class MarkdownConverter {
+    constructor() {
+      if (typeof TurndownService !== 'function') throw new Error('Turndown missing');
 
-      let codeEl = pre.querySelector('code');
-      let lang = '';
+      this.td = new TurndownService({
+        codeBlockStyle: 'fenced',
+        emDelimiter: '*',
+        strongDelimiter: '**',
+        bulletListMarker: '-',
+        headingStyle: 'atx',
+      });
 
-      function extractLangFrom(el) {
-        const classes = Array.from((el && el.classList) || []);
-        for (const cls of classes) {
-          const match = cls.match(/^(?:language-|lang-|language_)([a-zA-Z0-9+-]+)/);
-          if (match) return match[1];
+      if (window.turndownPluginGfm?.gfm) this.td.use(window.turndownPluginGfm.gfm);
+
+      // Code blocks: turn <pre> into fenced code
+      this.td.addRule('preToFence', {
+        filter: (node) => node.nodeName && node.nodeName.toLowerCase() === 'pre',
+        replacement: (_content, node) => {
+          const pre = node;
+          const code = pre.querySelector('code') || pre;
+          const raw = code.textContent || '';
+          const lang = detectCodeLanguage(code, pre);
+          return fenceCode(raw, lang);
         }
-        const dataLang = el && (el.getAttribute('data-language') || el.getAttribute('data-lang'));
-        return dataLang || '';
-      }
+      });
 
-      if (codeEl) lang = extractLangFrom(codeEl);
-      else {
-        const ancestorCode = pre.closest('code');
-        if (ancestorCode) lang = extractLangFrom(ancestorCode);
-      }
-      if (!lang) lang = extractLangFrom(pre);
+      // MathJax v3: <mjx-container> has assistive MathML
+      this.td.addRule('MathJax', {
+        filter: (node) => node.nodeName && node.nodeName.toLowerCase() === 'mjx-container',
+        replacement: (content, node) => {
+          if (!(node instanceof HTMLElement)) return content;
+          const assistive = node.querySelector('mjx-assistive-mml');
+          const mathEl = assistive?.querySelector('math');
+          if (!mathEl) return content;
 
-      const codeText = pre.textContent || '';
-      if (!codeText.trim()) return;
+          const conv = getMathMLToLatexConverter();
+          if (!conv) return content;
 
-      const placeholder = createCodePlaceholder(codeText, lang);
-      pre.__codeHandled = true;
-      pre.replaceWith(root.ownerDocument.createTextNode(placeholder));
-    });
-  }
+          let latex = '';
+          try { latex = String(conv(mathEl.outerHTML)).trim(); }
+          catch { return content; }
 
-  // ---------------- Postprocessing: list spacing ----------------
-  function collapseListSpacing(md) {
-    return md.replace(/\n\s*\n(?=\s*(?:[-*+]\s|\d+\.\s))/g, '\n');
-  }
+          const norm = normalizeWikiTex(latex);
+          const isBlock = norm.forceDisplay || mathEl.getAttribute('display') === 'block';
+          return isBlock ? `\n$$\n${norm.latex}\n$$\n` : `$${norm.latex}$`;
+        }
+      });
 
-  // ---------------- Postprocessing: remove extra padding around fences ($$ and ```) ----------------
-  function collapseFencePadding(md) {
-    let out = md.replace(/\r\n/g, '\n');
+      // MediaWiki/Wikipedia + generic <math> and fallback images (Obsidian-like rule)
+      this.td.addRule('math', {
+        filter: (node) => {
+          if (!node || !(node instanceof Element)) return false;
+          const nn = node.nodeName.toLowerCase();
+          if (nn === 'math') return true;
+          if (!node.classList) return false;
+          return node.classList.contains('mwe-math-element') ||
+            node.classList.contains('mwe-math-fallback-image-inline') ||
+            node.classList.contains('mwe-math-fallback-image-display');
+        },
+        replacement: (content, node) => {
+          if (!(node instanceof Element)) return content;
 
-    out = out.replace(/([^\n])\n{2,}```/g, '$1\n```');
-    out = out.replace(/```\n{2,}([^\n])/g, '```\n$1');
+          let latexRaw = extractLatexFromElement(node);
+          latexRaw = (latexRaw || '').trim();
+          if (!latexRaw) return '';
 
-    out = out.replace(/([^\n])\n{2,}\$\$/g, '$1\n$$');
-    out = out.replace(/\$\$\n{2,}([^\n])/g, '$$\n$1');
+          const norm = normalizeWikiTex(latexRaw);
+          const latex = norm.latex;
 
-    out = out.replace(/\n{3,}/g, '\n\n');
-    return out;
-  }
+          // table-safety like Obsidian: avoid block $$ inside tables
+          const isInTable = node.closest('table') !== null;
 
-  // ---------------- Selection -> Markdown (with math context expansion) ----------------
-  function selectionToMarkdown() {
-    const sel = window.getSelection();
-    if (!sel || sel.isCollapsed || sel.rangeCount === 0) return null;
+          // Display if:
+          // - forced by \displaystyle
+          // - math@display=block
+          // - fallback display class
+          // - (Obsidian heuristic) parent is mwe-math-element and previous sibling is <p>
+          const displayByDom =
+            node.getAttribute('display') === 'block' ||
+            node.classList.contains('mwe-math-fallback-image-display') ||
+            (node.parentElement &&
+              node.parentElement.classList.contains('mwe-math-element') &&
+              node.parentElement.previousElementSibling &&
+              node.parentElement.previousElementSibling.nodeName.toLowerCase() === 'p');
 
-    let range = sel.getRangeAt(0);
-    const ancestor = range.commonAncestorContainer;
-    if (isInEditable(ancestor)) return null;
+          const isDisplay = !isInTable && (norm.forceDisplay || displayByDom);
 
-    // Expand range edges if inside math containers. Prefer display wrappers.
-    try {
-      const pickMathContainer = (el) => {
-        if (!el || !el.closest) return null;
-        return el.closest(
-          'span.katex-display,' +
-          'mjx-container[display="true"],mjx-container[display="block"],mjx-container[display],' +
-          'math[display="block"],math[display="true"],' +
-          '.mwe-math-element,' +
-          'span.katex,mjx-container,math'
-        );
-      };
+          if (isDisplay) return `\n$$\n${latex}\n$$\n`;
 
-      const startEl = (range.startContainer.nodeType === Node.TEXT_NODE ? range.startContainer.parentElement : range.startContainer);
-      const endEl = (range.endContainer.nodeType === Node.TEXT_NODE ? range.endContainer.parentElement : range.endContainer);
+          // Inline spacing (Obsidian-like)
+          const prevNode = node.previousSibling;
+          const nextNode = node.nextSibling;
+          const prevChar = prevNode?.textContent?.slice(-1) || '';
+          const nextChar = nextNode?.textContent?.[0] || '';
+          const isStartOfLine = !prevNode || (prevNode.nodeType === Node.TEXT_NODE && (prevNode.textContent || '').trim() === '');
+          const isEndOfLine = !nextNode || (nextNode.nodeType === Node.TEXT_NODE && (nextNode.textContent || '').trim() === '');
+          const leftSpace = (!isStartOfLine && prevChar && !/[\s$]/.test(prevChar)) ? ' ' : '';
+          const rightSpace = (!isEndOfLine && nextChar && !/[\s$]/.test(nextChar)) ? ' ' : '';
+          return `${leftSpace}$${latex}$${rightSpace}`;
+        }
+      });
 
-      const startMath = pickMathContainer(startEl);
-      const endMath = pickMathContainer(endEl);
+      // Images default
+      this.td.addRule('images', {
+        filter: 'img',
+        replacement: (_content, node) => {
+          const img = node;
+          // After math rule, we can optionally drop remaining MediaWiki math images
+          const src = img.getAttribute('src') || img.getAttribute('data-src') || '';
+          if (Policies.wikipediaRemoveResidualMathImagesAfterExtract && /\/media\/math\/render\//.test(src)) return '';
+          const alt = (img.getAttribute('alt') || '').replace(/\s+/g, ' ').trim();
+          if (!src) return '';
+          return `![${alt}](${src})`;
+        }
+      });
+    }
 
-      if (startMath) range.setStartBefore(startMath);
-      if (endMath) range.setEndAfter(endMath);
-    } catch { /* ignore */ }
-
-    const fragment = range.cloneContents();
-    const container = document.createElement('div');
-    container.appendChild(fragment);
-
-    MATH_SNIPPETS = [];
-    CODE_SNIPPETS = [];
-
-    convertCodeBlocks(container);
-
-    // IMPORTANT: MediaWiki conversion must run BEFORE general math conversion
-    // to avoid MathML text + image duplicates.
-    convertMediaWikiMath(container);
-
-    convertMathInContainer(container);
-    convertInlineTeXTextNodes(container);
-
-    const html = container.innerHTML;
-    if (!html.trim()) return null;
-
-    let md = turndownService.turndown(html);
-    md = restoreMathPlaceholders(md);
-    md = restoreCodePlaceholders(md);
-    md = collapseListSpacing(md);
-    md = collapseFencePadding(md);
-    md = md.trim();
-
-    if (DEBUG) console.log('[AutoMarkdown] FINAL MD:\n', md);
-    return md;
-  }
-
-  // ---------------- Copy toast ----------------
-  function showCopyToast() {
-    const div = document.createElement('div');
-    div.textContent = '⧉';
-    div.style.position = 'fixed';
-    div.style.bottom = '20px';
-    div.style.right = '20px';
-    div.style.fontSize = '26px';
-    div.style.opacity = '0';
-    div.style.transition = 'opacity 0.25s';
-    div.style.zIndex = '999999999';
-    div.style.userSelect = 'none';
-    div.style.pointerEvents = 'none';
-    div.style.color = 'var(--text-normal, #dadada)';
-
-    document.body.appendChild(div);
-    requestAnimationFrame(() => { div.style.opacity = '1'; });
-
-    setTimeout(() => {
-      div.style.opacity = '0';
-      setTimeout(() => div.remove(), 250);
-    }, 600);
-  }
-
-  // ---------------- Auto-copy logic ----------------
-  let lastCopied = '';
-
-  function handleSelectionEvent() {
-    const md = selectionToMarkdown();
-    if (!md) return;
-    if (md === lastCopied) return;
-    lastCopied = md;
-
-    try {
-      GM_setClipboard(md, { type: 'text/plain', mimetype: 'text/plain' });
-      showCopyToast();
-    } catch (err) {
-      console.error('[AutoMarkdown] Failed to copy to clipboard:', err);
+    convert(container) {
+      return this.td.turndown(container.innerHTML);
     }
   }
 
-  document.addEventListener('mouseup', handleSelectionEvent);
-  document.addEventListener('keyup', handleSelectionEvent);
+  function normalizeBlanklinesBlockSafe(md, maxBlank) {
+    const lines = md.replace(/\r\n/g, '\n').split('\n');
+    const out = [];
+    let inFence = false;
+    let inDisplayMath = false;
+    let blankCount = 0;
+
+    for (const line of lines) {
+      if (/^\s*```/.test(line)) { inFence = !inFence; out.push(line); blankCount = 0; continue; }
+      if (/^\s*\$\$\s*$/.test(line)) { inDisplayMath = !inDisplayMath; out.push(line); blankCount = 0; continue; }
+
+      const isTableLine = /^\s*\|.*\|\s*$/.test(line) || /^\s*\|?[-: ]+\|[-|: ]*\s*$/.test(line);
+      const isBlank = !line.trim();
+
+      if (inFence || inDisplayMath || isTableLine) { out.push(line); blankCount = 0; continue; }
+
+      if (isBlank) { blankCount++; if (blankCount <= maxBlank) out.push(''); }
+      else { blankCount = 0; out.push(line); }
+    }
+    return out.join('\n');
+  }
+
+  function tightenAdjacentDisplayMathBlocks(md) {
+    const lines = md.split('\n');
+    const out = [];
+    for (let i = 0; i < lines.length; i++) {
+      out.push(lines[i]);
+      if (/^\s*\$\$\s*$/.test(lines[i])) {
+        const a = lines[i + 1];
+        const b = lines[i + 2];
+        if (a !== undefined && b !== undefined && !a.trim() && /^\s*\$\$\s*$/.test(b)) i += 1;
+      }
+    }
+    return out.join('\n');
+  }
+
+  function tightenListsBlockSafe(md) {
+    const lines = md.split('\n');
+    const out = [];
+    const isBlank = (l) => !l.trim();
+    const listMatch = (l) => l.match(/^(\s*)([-*+]|\d+\.)\s+/);
+    const fence = (l) => /^\s*```/.test(l);
+    const disp = (l) => /^\s*\$\$\s*$/.test(l);
+
+    let inFence = false;
+    let inDisplayMath = false;
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+
+      if (fence(line)) { inFence = !inFence; out.push(line); continue; }
+      if (disp(line)) { inDisplayMath = !inDisplayMath; out.push(line); continue; }
+      if (inFence || inDisplayMath) { out.push(line); continue; }
+
+      if (isBlank(line)) {
+        const prev = out.length ? out[out.length - 1] : '';
+        const next = (i + 1 < lines.length) ? lines[i + 1] : '';
+        const p = listMatch(prev);
+        const n = listMatch(next);
+        if (p && n && p[1].length === n[1].length) continue;
+      }
+      out.push(line);
+    }
+    return out.join('\n');
+  }
+
+  function postProcess(md) {
+    let out = md;
+    out = normalizeBlanklinesBlockSafe(out, Policies.blanklineMax);
+    if (Policies.tightLists) out = tightenListsBlockSafe(out);
+    if (Policies.adjacentDisplayMathTight) out = tightenAdjacentDisplayMathBlocks(out);
+    return out.trim() + '\n';
+  }
+
+  class Engine {
+    constructor() {
+      this.inFlight = false;
+      this.queued = false;
+      this.lastSig = null;
+      this.cooldownUntil = 0;
+    }
+
+    handleTrigger() {
+      const now = Date.now();
+      if (now < this.cooldownUntil) return;
+      this.cooldownUntil = now + Policies.cooldownMs;
+
+      const sel = window.getSelection();
+      if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
+      if (isEditableTarget(sel.anchorNode)) return;
+
+      const range = capture.getPrimaryRange();
+      if (!range) return;
+
+      const tmp = capture.cloneFragment(range);
+      const text = normalizeInvisibleUnicode(sel.toString() || '');
+      if (!text.trim()) return;
+
+      const htmlSig = stableHash((tmp.innerHTML || '').slice(0, 20000));
+      const sig = stableHash(text + '|' + htmlSig);
+      if (sig === this.lastSig) return;
+      this.lastSig = sig;
+
+      if (this.inFlight) { this.queued = true; return; }
+      this.inFlight = true;
+
+      try {
+        const container = tmp;
+        sanitizer.sanitize(container);
+
+        let md;
+        try { md = new MarkdownConverter().convert(container); }
+        catch (e) { Log.w('Turndown missing; copying plain text', e); md = text.trim() + '\n'; }
+
+        md = postProcess(md);
+
+        const write = clipboard.writeNow(md);
+        if (!write.started) toast.show('Copy failed (clipboard blocked)', false);
+        else if (write.immediateOk) toast.show('Copied Markdown', true);
+        else if (write.promise) write.promise.then(ok => toast.show(ok ? 'Copied Markdown' : 'Copy failed', ok));
+        else toast.show('Copied Markdown', true);
+
+      } catch (e) {
+        Log.w('Pipeline failed', e);
+        toast.show('Copy failed', false);
+      } finally {
+        this.inFlight = false;
+        if (this.queued) { this.queued = false; setTimeout(() => this.handleTrigger(), 0); }
+      }
+    }
+  }
+
+  const engine = new Engine();
+
+  let timer = null;
+  function schedule() {
+    clearTimeout(timer);
+    timer = setTimeout(() => engine.handleTrigger(), Policies.debounceMs);
+  }
+
+  window.addEventListener('mouseup', schedule, true);
+  window.addEventListener('keyup', (e) => {
+    if (e.key === 'Shift' || e.key === 'Control' || e.key === 'Alt' || e.key === 'Meta') return;
+    schedule();
+  }, true);
+
 })();
